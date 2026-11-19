@@ -801,33 +801,22 @@ XROCKET_LEGACY_URL = "https://pay.xrocket.tg"
 
 
 def _extract_xrocket_link_and_id(payload: object) -> tuple[str, str]:
-  """Находит ссылку на оплату и ID инвойса в любом уровне ответа xRocket."""
-  link_keys = (
-      "paymentLink",
-      "invoiceLink",
-      "payLink",
-      "payUrl",
-      "checkoutUrl",
-      "botLink",
-      "link",
-      "url",
-  )
-  id_keys = ("invoiceId", "id", "uuid")
-
+  """Ищет реальную ссылку на оплату и ID счёта в любом поле ответа API."""
   found_link = ""
   found_id = ""
+  id_keys = ("invoiceId", "id", "uuid")
 
   def walk(obj):
     nonlocal found_link, found_id
     if isinstance(obj, dict):
-      for k in link_keys:
-        val = obj.get(k)
-        if (
-            isinstance(val, str)
-            and val.strip().startswith(("http://", "https://", "tg://"))
-            and not found_link
-        ):
-          found_link = val.strip()
+      for k, v in obj.items():
+        if isinstance(v, str):
+          s = v.strip()
+          if s.startswith(("http://", "https://", "tg://")) and not found_link:
+            found_link = s
+          elif k.lower().endswith(("link", "url")) and not found_link:
+            if s.startswith("t.me/"):
+              found_link = f"https://{s}"
       for k in id_keys:
         val = obj.get(k)
         if val is not None and str(val).strip() and not found_id:
@@ -896,9 +885,9 @@ async def create_xrocket_invoice(
             data = await resp.json()
           except Exception:
             data = {}
+          keys_info = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+          logger.info(f"xRocket 201 top keys: {keys_info}")
           pay_link, inv_id = _extract_xrocket_link_and_id(data)
-          if not pay_link and inv_id:
-            pay_link = f"https://t.me/xrocket?start=inv_{inv_id}"
           if pay_link:
             if inv_id and user_id:
               INVOICE_TO_USER[inv_id] = user_id
@@ -907,9 +896,8 @@ async def create_xrocket_invoice(
             )
             return pay_link, inv_id or None, ""
           last_error = (
-              data.get("detail")
-              or data.get("message")
-              or f"API вернул статус {resp.status} без ссылки на оплату"
+              f"В ответе xRocket нет поля ссылки (id={inv_id}, ключи:"
+              f" {keys_info}). Посмотри полный лог 201."
           )
         else:
           try:
@@ -969,8 +957,6 @@ async def create_xrocket_invoice(
             except Exception:
               data = {}
             pay_link, inv_id = _extract_xrocket_link_and_id(data)
-            if not pay_link and inv_id:
-              pay_link = f"https://t.me/xrocket?start=inv_{inv_id}"
             if pay_link:
               if inv_id and user_id:
                 INVOICE_TO_USER[inv_id] = user_id
