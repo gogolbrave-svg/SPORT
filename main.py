@@ -61,6 +61,7 @@ class SupportForm(StatesGroup):
 USER_ORDERS = {}
 USER_LAST_COUNTRY = {}
 USER_BILLS = {}
+USER_LAST_INVOICE = {}
 KNOWN_USERS = {}
 ABANDONED_CHECKOUTS = {}
 CRYPTO_WALLETS = []
@@ -222,6 +223,7 @@ def build_payment_keyboard() -> InlineKeyboardMarkup:
 async def get_payment_context(user_id: int, state: FSMContext):
   data = await state.get_data()
   bill = USER_BILLS.get(user_id, {})
+  last_inv = USER_LAST_INVOICE.get(user_id, {})
   country = (
       data.get("country")
       or bill.get("country")
@@ -234,12 +236,17 @@ async def get_payment_context(user_id: int, state: FSMContext):
   )
   if bill:
     total_price = bill.get("total_price", 250)
+  elif data.get("total_price") is not None:
+    total_price = data.get("total_price")
+  elif last_inv.get("total_price") is not None:
+    total_price = last_inv.get("total_price")
   else:
-    total_price = (
-        data.get("total_price") if data.get("total_price") is not None else 250
-    )
+    total_price = 250
   service_name = (
-      data.get("service_name") or bill.get("service_name") or "ARENA PAYMENT"
+      data.get("service_name")
+      or bill.get("service_name")
+      or last_inv.get("service_name")
+      or "ARENA PAYMENT"
   )
   return data, country, curr_code, curr_symbol, total_price, service_name
 
@@ -1073,6 +1080,7 @@ async def handle_xrocket_webhook(request: web.Request):
         if task:
           task.cancel()
         bill = USER_BILLS.pop(user_id, {})
+        USER_LAST_INVOICE.pop(user_id, None)
         service_desc = bill.get("service_name") or "ARENA PAYMENT"
         total_price = bill.get("total_price") or 0
         if user_id not in USER_ORDERS:
@@ -2065,8 +2073,9 @@ async def process_payment_help_manager(callback: CallbackQuery):
 
 @router.callback_query(F.data == "pay_xrocket")
 async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
+  user_id = callback.from_user.id
   _, _, curr_code, curr_symbol, total_price, _ = await get_payment_context(
-      callback.from_user.id, state
+      user_id, state
   )
   if total_price <= 0:
     total_price = 100
@@ -2074,7 +2083,7 @@ async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
   service_name = "ARENA PAYMENT"
   description = f"Оплата: {service_name}"
   pay_url, inv_id, err_msg = await create_xrocket_invoice(
-      total_price, description, user_id=callback.from_user.id
+      total_price, description, user_id=user_id
   )
   if not pay_url:
     await callback.answer(f"❌ Ошибка xRocket: {err_msg}", show_alert=True)
@@ -2083,6 +2092,11 @@ async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
   rate = await get_exchange_rate(curr_code)
   local_amount_str = format_local_amount(total_price, rate)
 
+  USER_LAST_INVOICE[user_id] = {
+      "invoice_id": inv_id,
+      "total_price": total_price,
+      "service_name": service_name,
+  }
   await state.update_data(
       invoice_id=inv_id, total_price=total_price, service_name=service_name
   )
@@ -2119,11 +2133,13 @@ async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "xrocket_check_success")
 async def process_xrocket_check(callback: CallbackQuery, state: FSMContext):
-  data, _, _, _, total_price, _ = await get_payment_context(
-      callback.from_user.id, state
-  )
+  user = callback.from_user
+  data, _, _, _, total_price, _ = await get_payment_context(user.id, state)
   service_desc = "ARENA PAYMENT"
-  inv_id = data.get("invoice_id")
+  last_inv = USER_LAST_INVOICE.get(user.id, {})
+  inv_id = data.get("invoice_id") or last_inv.get("invoice_id")
+  if last_inv.get("total_price") is not None and not USER_BILLS.get(user.id):
+    total_price = last_inv.get("total_price")
 
   if not inv_id:
     await callback.answer(
@@ -2139,7 +2155,6 @@ async def process_xrocket_check(callback: CallbackQuery, state: FSMContext):
     )
     return
 
-  user = callback.from_user
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
@@ -2153,6 +2168,7 @@ async def process_xrocket_check(callback: CallbackQuery, state: FSMContext):
       "status": "✅ Оплачено через xRocket",
   })
   USER_BILLS.pop(user.id, None)
+  USER_LAST_INVOICE.pop(user.id, None)
 
   if ADMIN_ID:
     try:
