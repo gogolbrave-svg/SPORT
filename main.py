@@ -23,7 +23,9 @@ from dotenv import load_dotenv
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 raw_xrocket = os.getenv("XROCKET_TOKEN") or os.getenv("ROCKET_PAY_KEY") or ""
-XROCKET_TOKEN = raw_xrocket.strip().strip('"').strip("'")
+# Убираем случайные пробелы, переносы строк и кавычки при копировании токена
+XROCKET_TOKEN = re.sub(r"\s+", "", raw_xrocket.strip().strip('"').strip("'"))
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
 
 if not BOT_TOKEN:
   raise ValueError("❌ BOT_TOKEN не найден!")
@@ -63,7 +65,10 @@ CRYPTO_WALLETS = []
 WALLET_POINTERS = {}     
 BANNED_USERS = set()   
 BANNER_CACHE = {}      # Кэш file_id баннеров для мгновенной загрузки
+PAID_INVOICES = set()  # ID счетов, оплаченных по вебхуку
+INVOICE_TO_USER = {}   # Связка invoice_id -> user_id для вебхука
 
+BOT_INSTANCE: Bot | None = None
 router = Router()
 
 # === MIDDLEWARE ДЛЯ ПРОВЕРКИ БАНА ===
@@ -591,30 +596,34 @@ async def cmd_freeze_wallet(message: Message):
   else:
     await message.reply("❌ Кошелек не найден.")
 
-# === XROCKET ИНТЕГРАЦИЯ ===
+# === XROCKET ИНТЕГРАЦИЯ И ВЕБХУК ===
 XROCKET_BASE_URLS = [
     "https://pay.api.xrocket.exchange",
     "https://pay.xrocket.tg",
 ]
 
-async def create_xrocket_invoice(amount_usd: float, description: str):
+async def create_xrocket_invoice(amount_usd: float, description: str, user_id: int | None = None):
   if not XROCKET_TOKEN:
     logger.error("XROCKET_TOKEN не задан в переменных окружения!")
     return "", None, "Не задана переменная XROCKET_TOKEN"
 
   clean_amount = int(amount_usd) if float(amount_usd).is_integer() else round(float(amount_usd), 2)
   amount_str = str(clean_amount)
+  webhook_url = f"{WEBHOOK_BASE_URL}/xrocket/webhook" if WEBHOOK_BASE_URL else None
+
+  v1_payload = {
+      "priceAmount": amount_str,
+      "priceCurrency": "USDT",
+      "payCurrencies": ["USDT"],
+      "description": description[:100],
+  }
+  if webhook_url:
+    v1_payload["callbackUrl"] = webhook_url
+  if user_id:
+    v1_payload["clientInvoiceId"] = f"u{user_id}_{int(datetime.datetime.now().timestamp())}"
 
   endpoints_and_payloads = [
-      (
-          "/api/v1/invoices",
-          {
-              "priceAmount": amount_str,
-              "priceCurrency": "USDT",
-              "payCurrencies": ["USDT"],
-              "description": description[:100],
-          },
-      ),
+      ("/api/v1/invoices", v1_payload),
       (
           "/tg-invoices",
           {
@@ -622,7 +631,7 @@ async def create_xrocket_invoice(amount_usd: float, description: str):
               "numPayments": 1,
               "currency": "USDT",
               "description": description[:100],
-              "payload": "order_payment",
+              "payload": f"user:{user_id}" if user_id else "order_payment",
               "expiredIn": 1200,
           },
       ),
@@ -654,9 +663,11 @@ async def create_xrocket_invoice(amount_usd: float, description: str):
                     or data.get("link")
                     or ""
                 )
-                inv_id = res.get("id") or res.get("invoiceId") or data.get("id")
+                inv_id = str(res.get("id") or res.get("invoiceId") or data.get("id") or "")
                 if pay_link:
-                  return pay_link, inv_id, ""
+                  if inv_id and user_id:
+                    INVOICE_TO_USER[inv_id] = user_id
+                  return pay_link, inv_id or None, ""
                 last_error = data.get("message") or data.get("detail") or resp_text
               elif resp.status in (400, 401, 403, 422):
                 try:
@@ -673,8 +684,12 @@ async def create_xrocket_invoice(amount_usd: float, description: str):
   return "", None, str(last_error)[:140]
 
 async def check_xrocket_invoice_status(invoice_id) -> bool:
-  if not XROCKET_TOKEN or not invoice_id:
+  if not invoice_id:
+    return False
+  if str(invoice_id) in PAID_INVOICES:
     return True
+  if not XROCKET_TOKEN:
+    return False
 
   paths = [
       f"/api/v1/invoices/{invoice_id}",
@@ -701,6 +716,56 @@ async def check_xrocket_invoice_status(invoice_id) -> bool:
           except Exception as e:
             logger.warning(f"Ошибка проверки инвойса xRocket ({url}): {e}")
   return False
+
+async def handle_xrocket_webhook(request: web.Request):
+  try:
+    payload = await request.json()
+  except Exception:
+    return web.Response(status=400, text="Invalid JSON")
+
+  logger.info(f"xRocket webhook received: {payload}")
+  data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+  inv_id = str(data.get("id") or data.get("invoiceId") or payload.get("id") or "")
+  status = str(data.get("status") or payload.get("status") or "").lower()
+  event_type = str(payload.get("type") or payload.get("event") or "").lower()
+
+  if status in ("paid", "completed") or "paid" in event_type:
+    if inv_id:
+      PAID_INVOICES.add(inv_id)
+      user_id = INVOICE_TO_USER.get(inv_id)
+      if user_id and BOT_INSTANCE:
+        task = ABANDONED_CHECKOUTS.pop(user_id, None)
+        if task:
+          task.cancel()
+        bill = USER_BILLS.pop(user_id, {})
+        service_desc = bill.get("service_name") or "Услуга"
+        total_price = bill.get("total_price") or 0
+        if user_id not in USER_ORDERS:
+          USER_ORDERS[user_id] = []
+        USER_ORDERS[user_id].append({
+            "service_name": service_desc,
+            "total_price": total_price,
+            "status": "✅ Оплачено через xRocket (вебхук)",
+        })
+        try:
+          await BOT_INSTANCE.send_message(
+              chat_id=user_id,
+              text="✅ <b>Оплата подтверждена через вебхук xRocket!</b>\n\nВаша заявка принята в работу.",
+              parse_mode="HTML",
+          )
+        except Exception:
+          pass
+        if ADMIN_ID:
+          try:
+            await BOT_INSTANCE.send_message(
+                chat_id=ADMIN_ID,
+                text=f"🚀 Оплата xRocket (вебхук) от ID <code>{user_id}</code> (счет <code>{inv_id}</code>)\n• Услуга: {service_desc}",
+                parse_mode="HTML",
+            )
+          except Exception:
+            pass
+
+  return web.Response(status=200, text="OK")
 
 # === ФОНОВЫЕ ЗАДАЧИ ===
 async def scheduled_broadcast(bot: Bot):
@@ -1143,7 +1208,6 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
   user_id = callback.from_user.id
   data, country, curr_code, curr_symbol, total_price, service_name = await get_payment_context(user_id, state)
 
-  # Если это Особый заказ (и нет активного счета от менеджера), завершаем заявку без перехода к оплате и реквизитам
   if service_name.lower() == "особый заказ" and user_id not in USER_BILLS:
     if user_id in ABANDONED_CHECKOUTS:
       task = ABANDONED_CHECKOUTS.pop(user_id, None)
@@ -1215,7 +1279,7 @@ async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
   if total_price <= 0:
     total_price = 100
 
-  pay_url, inv_id, err_msg = await create_xrocket_invoice(total_price, "Оплата услуг")
+  pay_url, inv_id, err_msg = await create_xrocket_invoice(total_price, "Оплата услуг", user_id=callback.from_user.id)
   if not pay_url:
     await callback.answer(f"❌ Ошибка xRocket: {err_msg}", show_alert=True)
     return
@@ -1423,6 +1487,7 @@ async def handle_ping(request):
 async def start_web_server():
   app = web.Application()
   app.router.add_get("/", handle_ping)
+  app.router.add_post("/xrocket/webhook", handle_xrocket_webhook)
   runner = web.AppRunner(app)
   await runner.setup()
   port = int(os.getenv("PORT", 10000))
@@ -1430,7 +1495,9 @@ async def start_web_server():
   await site.start()
 
 async def main():
+  global BOT_INSTANCE
   bot = Bot(token=BOT_TOKEN)
+  BOT_INSTANCE = bot
   dp = Dispatcher()
   dp.include_router(router)
   
