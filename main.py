@@ -22,7 +22,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-XROCKET_TOKEN = os.getenv("XROCKET_TOKEN")
+raw_xrocket = os.getenv("XROCKET_TOKEN") or os.getenv("ROCKET_PAY_KEY") or ""
+XROCKET_TOKEN = raw_xrocket.strip().strip('"').strip("'")
 
 if not BOT_TOKEN:
   raise ValueError("❌ BOT_TOKEN не найден!")
@@ -591,49 +592,80 @@ async def cmd_freeze_wallet(message: Message):
     await message.reply("❌ Кошелек не найден.")
 
 # === XROCKET ИНТЕГРАЦИЯ ===
+XROCKET_BASE_URLS = [
+    "https://pay.xrocket.tg",
+    "https://pay.ton-rocket.com",
+]
+
 async def create_xrocket_invoice(amount_usd: float, description: str):
   if not XROCKET_TOKEN:
-    return "", None
-  url = "https://pay.ton-rocket.com/tg-invoices"
-  headers = {"Rocket-Pay-Key": XROCKET_TOKEN, "Content-Type": "application/json"}
+    logger.error("XROCKET_TOKEN не задан в переменных окружения!")
+    return "", None, "Не задана переменная XROCKET_TOKEN"
+
+  headers = {
+      "Rocket-Pay-Key": XROCKET_TOKEN,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+  }
+  clean_amount = int(amount_usd) if float(amount_usd).is_integer() else round(float(amount_usd), 2)
   payload = {
-      "amount": float(amount_usd),
+      "amount": clean_amount,
       "numPayments": 1,
       "currency": "USDT",
-      "description": description,
+      "description": description[:100],
       "payload": "order_payment",
-      "expiredIn": 1200
+      "expiredIn": 1200,
   }
-  try:
-    async with ClientSession() as session:
-      async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
-        if resp.status in (200, 201):
-          data = await resp.json()
-          if data.get("success"):
-            res = data.get("data", {})
-            return res.get("link", ""), res.get("id")
-        else:
-          err_text = await resp.text()
-          logger.error(f"Ошибка ответа xRocket ({resp.status}): {err_text}")
-  except Exception as e:
-    logger.error(f"Ошибка xRocket: {e}")
-  return "", None
+
+  last_error = "Неизвестная ошибка API"
+  for base_url in XROCKET_BASE_URLS:
+    url = f"{base_url}/tg-invoices"
+    try:
+      async with ClientSession() as session:
+        async with session.post(url, json=payload, headers=headers, timeout=12) as resp:
+          resp_text = await resp.text()
+          logger.info(f"xRocket POST {url} -> {resp.status}: {resp_text}")
+          if resp.status in (200, 201):
+            data = await resp.json()
+            if data.get("success"):
+              res = data.get("data", {})
+              pay_link = res.get("link") or res.get("payUrl") or res.get("url") or ""
+              inv_id = res.get("id")
+              if pay_link:
+                return pay_link, inv_id, ""
+            last_error = data.get("message") or resp_text
+          else:
+            try:
+              err_json = await resp.json()
+              last_error = err_json.get("message") or f"HTTP {resp.status}"
+            except Exception:
+              last_error = f"HTTP {resp.status}"
+    except Exception as e:
+      logger.error(f"Ошибка запроса xRocket ({url}): {e}")
+      last_error = str(e)
+
+  return "", None, str(last_error)[:120]
 
 async def check_xrocket_invoice_status(invoice_id) -> bool:
   if not XROCKET_TOKEN or not invoice_id:
     return True
-  url = f"https://pay.ton-rocket.com/tg-invoices/{invoice_id}"
-  headers = {"Rocket-Pay-Key": XROCKET_TOKEN}
-  try:
-    async with ClientSession() as session:
-      async with session.get(url, headers=headers, timeout=10) as resp:
-        if resp.status == 200:
-          data = await resp.json()
-          if data.get("success"):
-            status = data.get("data", {}).get("status", "")
-            return status == "paid"
-  except Exception as e:
-    logger.error(f"Ошибка проверки инвойса xRocket: {e}")
+  headers = {
+      "Rocket-Pay-Key": XROCKET_TOKEN,
+      "Accept": "application/json",
+  }
+  for base_url in XROCKET_BASE_URLS:
+    url = f"{base_url}/tg-invoices/{invoice_id}"
+    try:
+      async with ClientSession() as session:
+        async with session.get(url, headers=headers, timeout=10) as resp:
+          if resp.status == 200:
+            data = await resp.json()
+            if data.get("success"):
+              inv_data = data.get("data", {})
+              status = str(inv_data.get("status", "")).lower()
+              return status in ("paid", "completed")
+    except Exception as e:
+      logger.error(f"Ошибка проверки инвойса xRocket ({url}): {e}")
   return False
 
 # === ФОНОВЫЕ ЗАДАЧИ ===
@@ -1149,9 +1181,9 @@ async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
   if total_price <= 0:
     total_price = 100
 
-  pay_url, inv_id = await create_xrocket_invoice(total_price, "Оплата услуг")
+  pay_url, inv_id, err_msg = await create_xrocket_invoice(total_price, "Оплата услуг")
   if not pay_url:
-    await callback.answer("❌ Сервис xRocket временно недоступен.", show_alert=True)
+    await callback.answer(f"❌ Ошибка xRocket: {err_msg}", show_alert=True)
     return
 
   rate = await get_exchange_rate(curr_code)
