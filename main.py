@@ -239,7 +239,7 @@ async def get_payment_context(user_id: int, state: FSMContext):
         data.get("total_price") if data.get("total_price") is not None else 250
     )
   service_name = (
-      data.get("service_name") or bill.get("service_name") or "Услуга"
+      data.get("service_name") or bill.get("service_name") or "ARENA PAYMENT"
   )
   return data, country, curr_code, curr_symbol, total_price, service_name
 
@@ -521,9 +521,11 @@ async def cmd_bill_user(message: Message, state: FSMContext):
     )
     return
 
-  service_name = " ".join(parts[1:-1]).strip() if len(parts) > 2 else "Особый заказ"
+  service_name = (
+      " ".join(parts[1:-1]).strip() if len(parts) > 2 else "ARENA PAYMENT"
+  )
   if not service_name:
-    service_name = "Особый заказ"
+    service_name = "ARENA PAYMENT"
 
   amount_val = (
       int(amount_usd) if amount_usd.is_integer() else round(amount_usd, 2)
@@ -801,22 +803,32 @@ XROCKET_LEGACY_URL = "https://pay.xrocket.tg"
 
 
 def _extract_xrocket_link_and_id(payload: object) -> tuple[str, str]:
-  """Ищет реальную ссылку на оплату и ID счёта в любом поле ответа API."""
+  link_keys = (
+      "paymentLink",
+      "invoiceLink",
+      "payLink",
+      "payUrl",
+      "checkoutUrl",
+      "botLink",
+      "link",
+      "url",
+  )
+  id_keys = ("invoiceId", "id", "uuid")
+
   found_link = ""
   found_id = ""
-  id_keys = ("invoiceId", "id", "uuid")
 
   def walk(obj):
     nonlocal found_link, found_id
     if isinstance(obj, dict):
-      for k, v in obj.items():
-        if isinstance(v, str):
-          s = v.strip()
-          if s.startswith(("http://", "https://", "tg://")) and not found_link:
-            found_link = s
-          elif k.lower().endswith(("link", "url")) and not found_link:
-            if s.startswith("t.me/"):
-              found_link = f"https://{s}"
+      for k in link_keys:
+        val = obj.get(k)
+        if (
+            isinstance(val, str)
+            and val.strip().startswith(("http://", "https://", "tg://"))
+            and not found_link
+        ):
+          found_link = val.strip()
       for k in id_keys:
         val = obj.get(k)
         if val is not None and str(val).strip() and not found_id:
@@ -885,9 +897,9 @@ async def create_xrocket_invoice(
             data = await resp.json()
           except Exception:
             data = {}
-          keys_info = list(data.keys()) if isinstance(data, dict) else type(data).__name__
-          logger.info(f"xRocket 201 top keys: {keys_info}")
           pay_link, inv_id = _extract_xrocket_link_and_id(data)
+          if not pay_link and inv_id:
+            pay_link = f"https://t.me/xrocket?start=inv_{inv_id}"
           if pay_link:
             if inv_id and user_id:
               INVOICE_TO_USER[inv_id] = user_id
@@ -896,8 +908,9 @@ async def create_xrocket_invoice(
             )
             return pay_link, inv_id or None, ""
           last_error = (
-              f"В ответе xRocket нет поля ссылки (id={inv_id}, ключи:"
-              f" {keys_info}). Посмотри полный лог 201."
+              data.get("detail")
+              or data.get("message")
+              or f"API вернул статус {resp.status} без ссылки на оплату"
           )
         else:
           try:
@@ -957,6 +970,8 @@ async def create_xrocket_invoice(
             except Exception:
               data = {}
             pay_link, inv_id = _extract_xrocket_link_and_id(data)
+            if not pay_link and inv_id:
+              pay_link = f"https://t.me/xrocket?start=inv_{inv_id}"
             if pay_link:
               if inv_id and user_id:
                 INVOICE_TO_USER[inv_id] = user_id
@@ -1058,7 +1073,7 @@ async def handle_xrocket_webhook(request: web.Request):
         if task:
           task.cancel()
         bill = USER_BILLS.pop(user_id, {})
-        service_desc = bill.get("service_name") or "Услуга"
+        service_desc = bill.get("service_name") or "ARENA PAYMENT"
         total_price = bill.get("total_price") or 0
         if user_id not in USER_ORDERS:
           USER_ORDERS[user_id] = []
@@ -2050,15 +2065,14 @@ async def process_payment_help_manager(callback: CallbackQuery):
 
 @router.callback_query(F.data == "pay_xrocket")
 async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
-  _, _, curr_code, curr_symbol, total_price, service_name = (
-      await get_payment_context(callback.from_user.id, state)
+  _, _, curr_code, curr_symbol, total_price, _ = await get_payment_context(
+      callback.from_user.id, state
   )
   if total_price <= 0:
     total_price = 100
 
-  description = (
-      f"Оплата: {service_name}" if service_name else "Оплата услуг"
-  )
+  service_name = "ARENA PAYMENT"
+  description = f"Оплата: {service_name}"
   pay_url, inv_id, err_msg = await create_xrocket_invoice(
       total_price, description, user_id=callback.from_user.id
   )
@@ -2069,7 +2083,9 @@ async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
   rate = await get_exchange_rate(curr_code)
   local_amount_str = format_local_amount(total_price, rate)
 
-  await state.update_data(invoice_id=inv_id, total_price=total_price)
+  await state.update_data(
+      invoice_id=inv_id, total_price=total_price, service_name=service_name
+  )
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
           [
@@ -2093,6 +2109,7 @@ async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
   )
   text = (
       f"🚀 <b>Оплата через xRocket</b>\n\n"
+      f"• Назначение: <b>{service_name}</b>\n"
       f"К оплате: <b>{total_price} USDT</b> <i>({local_amount_str}"
       f" {curr_symbol})</i>\n\n"
       "После оплаты нажмите кнопку проверки:"
@@ -2102,9 +2119,10 @@ async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "xrocket_check_success")
 async def process_xrocket_check(callback: CallbackQuery, state: FSMContext):
-  data, _, _, _, total_price, service_desc = await get_payment_context(
+  data, _, _, _, total_price, _ = await get_payment_context(
       callback.from_user.id, state
   )
+  service_desc = "ARENA PAYMENT"
   inv_id = data.get("invoice_id")
 
   if not inv_id:
