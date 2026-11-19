@@ -1,7 +1,7 @@
 import asyncio
 import datetime
-import logging 
-import os 
+import logging
+import os
 import random
 import re
 from aiogram import Bot, Dispatcher, F, Router
@@ -23,7 +23,6 @@ from dotenv import load_dotenv
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 raw_xrocket = os.getenv("XROCKET_TOKEN") or os.getenv("ROCKET_PAY_KEY") or ""
-# Убираем случайные пробелы, переносы строк и кавычки при копировании токена
 XROCKET_TOKEN = re.sub(r"\s+", "", raw_xrocket.strip().strip('"').strip("'"))
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
 
@@ -61,12 +60,12 @@ USER_LAST_COUNTRY = {}
 USER_BILLS = {}
 KNOWN_USERS = {}
 ABANDONED_CHECKOUTS = {}
-CRYPTO_WALLETS = []      
-WALLET_POINTERS = {}     
-BANNED_USERS = set()   
-BANNER_CACHE = {}      # Кэш file_id баннеров для мгновенной загрузки
-PAID_INVOICES = set()  # ID счетов, оплаченных по вебхуку
-INVOICE_TO_USER = {}   # Связка invoice_id -> user_id для вебхука
+CRYPTO_WALLETS = []
+WALLET_POINTERS = {}
+BANNED_USERS = set()
+BANNER_CACHE = {}
+PAID_INVOICES = set()
+INVOICE_TO_USER = {}
 
 BOT_INSTANCE: Bot | None = None
 router = Router()
@@ -219,17 +218,17 @@ def get_banner_path(banner_name: str):
         return os.path.join("banners", filename)
   return None
 
-# === УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ЦЕЛЬНОГО ОБНОВЛЕНИЯ БАННЕРОВ (С КЕШИРОВАНИЕМ FILE_ID) ===
+# === УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ЦЕЛЬНОГО ОБНОВЛЕНИЯ БАННЕРОВ ===
 async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_name: str, text: str, reply_markup: InlineKeyboardMarkup):
   bot = event.bot
   chat_id = event.chat.id if isinstance(event, Message) else event.message.chat.id
-  
+
   data = await state.get_data()
   bot_msg_id = data.get("bot_msg_id")
 
   photo_source = None
   banner_path = get_banner_path(banner_name)
-  
+
   if banner_name in BANNER_CACHE:
     photo_source = BANNER_CACHE[banner_name]
   elif banner_path and os.path.exists(banner_path):
@@ -248,7 +247,7 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
         else:
           await msg.delete()
           sent_msg = await bot.send_photo(chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML")
-        
+
         if not banner_name in BANNER_CACHE and hasattr(sent_msg, "photo") and sent_msg.photo:
           BANNER_CACHE[banner_name] = sent_msg.photo[-1].file_id
       except Exception:
@@ -494,20 +493,20 @@ async def admin_reply_handler(message: Message):
   allowed_staff = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid is not None}
   if allowed_staff and message.from_user.id not in allowed_staff:
     return
-  
+
   reply_msg = message.reply_to_message
   text_source = (reply_msg.text or "") + "\n" + (reply_msg.caption or "")
-  
+
   match = re.search(r"ID:\s*<code>(\d+)</code>|<code>(\d+)</code>", text_source)
   if not match:
     match = re.search(r"(?:ID:|\b)(\d{6,})", text_source)
-    
+
   if match:
     target_user_id = int(match.group(1) if match.lastindex == 1 else (match.group(1) or match.group(2)))
     text_lower = text_source.lower()
     is_special = "особый заказ" in text_lower or "заказ" in text_lower
     prefix = "💬 <b>Ответ от менеджера по вашему заказу:</b>" if is_special else "💬 <b>Ответ от службы поддержки:</b>"
-    
+
     try:
       await message.bot.send_message(
           chat_id=target_user_id,
@@ -547,7 +546,7 @@ async def cmd_add_wallet(message: Message):
 async def cmd_delete_wallet(message: Message):
   if ADMIN_ID and message.from_user.id != ADMIN_ID:
     return
-  global CRYPTO_WALLETS  
+  global CRYPTO_WALLETS
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
     await message.reply("❌ Использование: `/delete <номеркошелька> <монета> <сеть>`", parse_mode="Markdown")
@@ -596,11 +595,9 @@ async def cmd_freeze_wallet(message: Message):
   else:
     await message.reply("❌ Кошелек не найден.")
 
-# === XROCKET ИНТЕГРАЦИЯ И ВЕБХУК ===
-XROCKET_BASE_URLS = [
-    "https://pay.api.xrocket.exchange",
-    "https://pay.xrocket.tg",
-]
+# === XROCKET PAY API (CURRENT + LEGACY FALLBACK) И ВЕБХУК ===
+XROCKET_API_URL = "https://pay.api.xrocket.exchange"
+XROCKET_LEGACY_URL = "https://pay.xrocket.tg"
 
 async def create_xrocket_invoice(amount_usd: float, description: str, user_id: int | None = None):
   if not XROCKET_TOKEN:
@@ -622,66 +619,89 @@ async def create_xrocket_invoice(amount_usd: float, description: str, user_id: i
   if user_id:
     v1_payload["clientInvoiceId"] = f"u{user_id}_{int(datetime.datetime.now().timestamp())}"
 
-  endpoints_and_payloads = [
-      ("/api/v1/invoices", v1_payload),
-      (
-          "/tg-invoices",
-          {
-              "amount": clean_amount,
-              "numPayments": 1,
-              "currency": "USDT",
-              "description": description[:100],
-              "payload": f"user:{user_id}" if user_id else "order_payment",
-              "expiredIn": 1200,
-          },
-      ),
-  ]
-
-  auth_headers_list = [
-      {"Authorization": f"Bearer {XROCKET_TOKEN}", "Content-Type": "application/json", "Accept": "application/json"},
-      {"Rocket-Pay-Key": XROCKET_TOKEN, "Content-Type": "application/json", "Accept": "application/json"},
-  ]
+  bearer_headers = {
+      "Authorization": f"Bearer {XROCKET_TOKEN}",
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+  }
 
   last_error = "Не удалось создать счет в xRocket"
-  async with ClientSession() as session:
-    for base_url in XROCKET_BASE_URLS:
-      for path, payload in endpoints_and_payloads:
-        url = f"{base_url}{path}"
-        for headers in auth_headers_list:
-          try:
-            async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
-              resp_text = await resp.text()
-              logger.info(f"xRocket POST {url} -> {resp.status}: {resp_text}")
-              if resp.status in (200, 201):
-                data = await resp.json()
-                res = data.get("data") if isinstance(data.get("data"), dict) else data
-                pay_link = (
-                    res.get("link")
-                    or res.get("payLink")
-                    or res.get("payUrl")
-                    or res.get("url")
-                    or data.get("link")
-                    or ""
-                )
-                inv_id = str(res.get("id") or res.get("invoiceId") or data.get("id") or "")
-                if pay_link:
-                  if inv_id and user_id:
-                    INVOICE_TO_USER[inv_id] = user_id
-                  return pay_link, inv_id or None, ""
-                last_error = data.get("message") or data.get("detail") or resp_text
-              elif resp.status in (400, 401, 403, 422):
-                try:
-                  err_json = await resp.json()
-                  msg = err_json.get("message") or err_json.get("detail") or err_json.get("title")
-                  if msg:
-                    last_error = f"{msg} (HTTP {resp.status})"
-                except Exception:
-                  last_error = f"HTTP {resp.status}"
-          except Exception as e:
-            logger.warning(f"Ошибка запроса xRocket ({url}): {e}")
-            last_error = f"{type(e).__name__}: {e}"
+  auth_rejected = False
 
-  return "", None, str(last_error)[:140]
+  async with ClientSession() as session:
+    try:
+      url_v1 = f"{XROCKET_API_URL}/api/v1/invoices"
+      async with session.post(url_v1, json=v1_payload, headers=bearer_headers, timeout=10) as resp:
+        resp_text = await resp.text()
+        logger.info(f"xRocket POST {url_v1} -> {resp.status}: {resp_text}")
+        if resp.status in (200, 201):
+          data = await resp.json()
+          res = data.get("data") if isinstance(data.get("data"), dict) else data
+          pay_link = (
+              res.get("paymentLink")
+              or res.get("link")
+              or res.get("payLink")
+              or res.get("payUrl")
+              or res.get("url")
+              or data.get("paymentLink")
+              or data.get("link")
+              or ""
+          )
+          inv_id = str(res.get("id") or res.get("invoiceId") or data.get("id") or "")
+          if pay_link:
+            if inv_id and user_id:
+              INVOICE_TO_USER[inv_id] = user_id
+            return pay_link, inv_id or None, ""
+          last_error = data.get("detail") or data.get("message") or resp_text
+        else:
+          try:
+            err_json = await resp.json()
+            detail = err_json.get("detail") or err_json.get("message") or err_json.get("title") or f"HTTP {resp.status}"
+            if "unknown api key" in str(detail).lower() or resp.status in (401, 403):
+              auth_rejected = True
+              last_error = f"{detail} (проверьте Pay API токен и версию API в настройках приложения)"
+            else:
+              last_error = f"{detail} (HTTP {resp.status})"
+          except Exception:
+            if resp.status in (401, 403):
+              auth_rejected = True
+            last_error = f"HTTP {resp.status}"
+    except Exception as e:
+      logger.warning(f"Ошибка запроса xRocket ({XROCKET_API_URL}/api/v1/invoices): {e}")
+      last_error = f"{type(e).__name__}: {e}"
+
+    if not auth_rejected:
+      try:
+        url_legacy = f"{XROCKET_LEGACY_URL}/tg-invoices"
+        legacy_headers = {
+            "Rocket-Pay-Key": XROCKET_TOKEN,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        legacy_payload = {
+            "amount": clean_amount,
+            "numPayments": 1,
+            "currency": "USDT",
+            "description": description[:100],
+            "payload": f"user:{user_id}" if user_id else "order_payment",
+            "expiredIn": 1200,
+        }
+        async with session.post(url_legacy, json=legacy_payload, headers=legacy_headers, timeout=10) as resp:
+          resp_text = await resp.text()
+          logger.info(f"xRocket Legacy POST {url_legacy} -> {resp.status}: {resp_text}")
+          if resp.status in (200, 201):
+            data = await resp.json()
+            res = data.get("data") if isinstance(data.get("data"), dict) else data
+            pay_link = res.get("link") or res.get("payUrl") or res.get("url") or ""
+            inv_id = str(res.get("id") or "")
+            if pay_link:
+              if inv_id and user_id:
+                INVOICE_TO_USER[inv_id] = user_id
+              return pay_link, inv_id or None, ""
+      except Exception as e:
+        logger.warning(f"Ошибка резервного запроса xRocket Legacy: {e}")
+
+  return "", None, str(last_error)[:160]
 
 async def check_xrocket_invoice_status(invoice_id) -> bool:
   if not invoice_id:
@@ -691,30 +711,40 @@ async def check_xrocket_invoice_status(invoice_id) -> bool:
   if not XROCKET_TOKEN:
     return False
 
-  paths = [
-      f"/api/v1/invoices/{invoice_id}",
-      f"/tg-invoices/{invoice_id}",
-  ]
-  auth_headers_list = [
-      {"Authorization": f"Bearer {XROCKET_TOKEN}", "Accept": "application/json"},
-      {"Rocket-Pay-Key": XROCKET_TOKEN, "Accept": "application/json"},
-  ]
+  bearer_headers = {
+      "Authorization": f"Bearer {XROCKET_TOKEN}",
+      "Accept": "application/json",
+  }
 
   async with ClientSession() as session:
-    for base_url in XROCKET_BASE_URLS:
-      for path in paths:
-        url = f"{base_url}{path}"
-        for headers in auth_headers_list:
-          try:
-            async with session.get(url, headers=headers, timeout=10) as resp:
-              if resp.status == 200:
-                data = await resp.json()
-                inv_data = data.get("data") if isinstance(data.get("data"), dict) else data
-                status = str(inv_data.get("status", "")).lower()
-                if status in ("paid", "completed"):
-                  return True
-          except Exception as e:
-            logger.warning(f"Ошибка проверки инвойса xRocket ({url}): {e}")
+    try:
+      url_v1 = f"{XROCKET_API_URL}/api/v1/invoice"
+      async with session.get(url_v1, params={"invoiceId": invoice_id}, headers=bearer_headers, timeout=10) as resp:
+        if resp.status == 200:
+          data = await resp.json()
+          inv_data = data.get("data") if isinstance(data.get("data"), dict) else data
+          status = str(inv_data.get("status", "")).lower()
+          if status in ("paid", "completed"):
+            return True
+    except Exception as e:
+      logger.warning(f"Ошибка проверки инвойса xRocket Pay API: {e}")
+
+    try:
+      url_legacy = f"{XROCKET_LEGACY_URL}/tg-invoices/{invoice_id}"
+      legacy_headers = {
+          "Rocket-Pay-Key": XROCKET_TOKEN,
+          "Accept": "application/json",
+      }
+      async with session.get(url_legacy, headers=legacy_headers, timeout=10) as resp:
+        if resp.status == 200:
+          data = await resp.json()
+          inv_data = data.get("data") if isinstance(data.get("data"), dict) else data
+          status = str(inv_data.get("status", "")).lower()
+          if status in ("paid", "completed"):
+            return True
+    except Exception as e:
+      logger.warning(f"Ошибка проверки инвойса xRocket Legacy: {e}")
+
   return False
 
 async def handle_xrocket_webhook(request: web.Request):
@@ -788,7 +818,7 @@ async def scheduled_broadcast(bot: Bot):
               [InlineKeyboardButton(text="✨ Оформить со скидкой", callback_data="start_order", style="danger")],
               [InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]
           ])
-          
+
           if "special_offer.jpg" in BANNER_CACHE:
             photo = BANNER_CACHE["special_offer.jpg"]
             await bot.send_photo(chat_id=user_id, photo=photo, caption=text, reply_markup=keyboard, parse_mode="HTML")
@@ -799,7 +829,7 @@ async def scheduled_broadcast(bot: Bot):
               BANNER_CACHE["special_offer.jpg"] = sent.photo[-1].file_id
           else:
             await bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard, parse_mode="HTML")
-            
+
           KNOWN_USERS[user_id] = now
         except Exception as e:
           logger.error(f"Ошибка рассылки: {e}")
@@ -813,7 +843,7 @@ async def delayed_abandoned_cart_reminder(bot: Bot, user_id: int):
           [InlineKeyboardButton(text="🛒 Вернуться к заказу", callback_data="start_order", style="danger")],
           [InlineKeyboardButton(text="💬 Поддержка", callback_data="contact_admin", style="danger")]
       ])
-      
+
       banner_path = get_banner_path("abandoned_cart.jpg")
       if "abandoned_cart.jpg" in BANNER_CACHE:
         photo = BANNER_CACHE["abandoned_cart.jpg"]
@@ -825,7 +855,7 @@ async def delayed_abandoned_cart_reminder(bot: Bot, user_id: int):
           BANNER_CACHE["abandoned_cart.jpg"] = sent.photo[-1].file_id
       else:
         await bot.send_message(chat_id=user_id, text=reminder_text, reply_markup=keyboard, parse_mode="HTML")
-        
+
       ABANDONED_CHECKOUTS.pop(user_id, None)
   except asyncio.CancelledError:
     pass
@@ -1135,7 +1165,7 @@ async def process_target_data(message: Message, state: FSMContext):
 @router.message(OrderForm.photos, F.photo)
 async def process_photo(message: Message, state: FSMContext):
   await asyncio.sleep(0.3)
-  
+
   data = await state.get_data()
   photos = data.get("photos", [])
   if len(photos) >= 3:
@@ -1177,7 +1207,7 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
 
   await state.update_data(urgency=urgency, urgency_price=urg_price)
   data = await state.get_data()
-  
+
   base_service_price = data.get("service_price", 0)
   total_price = (base_service_price + urg_price) if base_service_price > 0 else 0
   await state.update_data(total_price=total_price)
@@ -1306,7 +1336,7 @@ async def process_pay_xrocket(callback: CallbackQuery, state: FSMContext):
 async def process_xrocket_check(callback: CallbackQuery, state: FSMContext):
   data, _, _, _, total_price, service_desc = await get_payment_context(callback.from_user.id, state)
   inv_id = data.get("invoice_id")
-  
+
   is_paid = await check_xrocket_invoice_status(inv_id)
   if not is_paid:
     await callback.answer("⏳ Платеж еще не поступил. Попробуйте через минуту.", show_alert=True)
@@ -1319,7 +1349,7 @@ async def process_xrocket_check(callback: CallbackQuery, state: FSMContext):
 
   if user.id not in USER_ORDERS:
     USER_ORDERS[user.id] = []
-  
+
   USER_ORDERS[user.id].append({"service_name": service_desc, "total_price": total_price, "status": "✅ Оплачено через xRocket"})
   USER_BILLS.pop(user.id, None)
 
@@ -1415,7 +1445,7 @@ async def process_receipt_photo(message: Message, state: FSMContext):
 
   if user.id not in USER_ORDERS:
     USER_ORDERS[user.id] = []
-  
+
   USER_ORDERS[user.id].append({"service_name": service_desc, "total_price": total_price, "status": "⏳ Ожидает проверки чека"})
   USER_BILLS.pop(user.id, None)
 
@@ -1500,7 +1530,7 @@ async def main():
   BOT_INSTANCE = bot
   dp = Dispatcher()
   dp.include_router(router)
-  
+
   try:
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
@@ -1511,11 +1541,11 @@ async def main():
     ])
   except Exception as e:
     logger.warning(f"Не удалось установить команды: {e}")
-  
+
   asyncio.create_task(start_web_server())
   asyncio.create_task(scheduled_broadcast(bot))
   await bot.delete_webhook(drop_pending_updates=True)
-  
+
   while True:
     try:
       logger.info("Запуск поллинга бота...")
