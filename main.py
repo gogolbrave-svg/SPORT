@@ -147,7 +147,7 @@ def get_next_wallet(coin: str, network: str):
 
 # === ФУНКЦИЯ ПОЛУЧЕНИЯ КУРСОВ ВАЛЮТ ===
 async def get_exchange_rate(target_currency: str) -> float:
-  url = "https://open.er-api.com/v6/latest/USD"
+  url = "[https://open.er-api.com/v6/latest/USD](https://open.er-api.com/v6/latest/USD)"
   try:
     async with ClientSession() as session:
       async with session.get(url, timeout=5) as response:
@@ -625,7 +625,7 @@ async def cmd_freeze_wallet(message: Message):
 async def create_cryptobot_invoice(amount_usd: float, description: str):
   if not CRYPTO_BOT_TOKEN:
     return "", None
-  url = "https://pay.crypt.bot/api/createInvoice"
+  url = "[https://pay.crypt.bot/api/createInvoice](https://pay.crypt.bot/api/createInvoice)"
   headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
   payload = {"asset": "USDT", "amount": str(amount_usd), "description": description, "payload": "order_payment"}
   try:
@@ -643,7 +643,7 @@ async def create_cryptobot_invoice(amount_usd: float, description: str):
 async def check_cryptobot_invoice_status(invoice_id: int) -> bool:
   if not CRYPTO_BOT_TOKEN or not invoice_id:
     return True
-  url = "https://pay.crypt.bot/api/getInvoices"
+  url = "[https://pay.crypt.bot/api/getInvoices](https://pay.crypt.bot/api/getInvoices)"
   headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
   params = {"invoice_ids": str(invoice_id)}
   try:
@@ -1414,4 +1414,3 @@ async def main():
 
 if __name__ == "__main__":
   asyncio.run(main())
-```[cite: 1]
