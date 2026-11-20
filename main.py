@@ -36,6 +36,14 @@ ADMIN_ID = int(admin_env) if admin_env and admin_env.isdigit() else None
 manager_env = os.getenv("MANAGER_ID")
 MANAGER_ID = int(manager_env) if manager_env and manager_env.isdigit() else None
 
+CRYPTOBOT_MINI_GUIDE = (
+    "\n\n📖 <b>Мини-гайд: как быстро и безопасно оплатить через CryptoBot</b>\n"
+    "1. Зайдите в @CryptoBot и откройте P2P Маркет\n"
+    "2. Пополните баланс USDT в любой удобной валюте вашей страны\n"
+    "3. Вернитесь в нашего бота и нажмите «Оплата через CryptoBot»\n"
+    "4. Нажмите «Оплатить счет» и подтвердите платеж — готово ✅"
+)
+
 class OrderForm(StatesGroup):
   service = State()
   debt_info = State()
@@ -412,6 +420,7 @@ async def cmd_bill_user(message: Message, state: FSMContext):
       "Время на завершение: <b><u>20:00</u></b>\n\n"
       f"🧾 <b>Счет на {service_name}</b>\n"
       f"К оплате: <b>{amount_str} USDT</b> <i>({local_str} {curr_info['symbol']})</i>"
+      f"{CRYPTOBOT_MINI_GUIDE}"
   )
 
   if service_name.lower() != "особый заказ":
@@ -1119,6 +1128,7 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
       "Время на завершение: <b><u>20:00</u></b>\n\n"
       f"{bill_prefix}"
       f"{amount_line}"
+      f"{CRYPTOBOT_MINI_GUIDE}"
   )
 
   await render_step(callback, state, "payment.jpg", payment_text, build_payment_keyboard(country))
