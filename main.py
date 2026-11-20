@@ -1284,20 +1284,22 @@ async def process_receipt_photo(message: Message, state: FSMContext):
   USER_ORDERS[user.id].append({"service_name": service_desc, "total_price": total_price, "status": "⏳ Ожидает проверки чека"})
   USER_BILLS.pop(user.id, None)
 
-  if ADMIN_ID:
+  extra_info = ""
+  if data.get("debt_info"):
+    extra_info += f"\n• Информация о долге: {data.get('debt_info')}"
+  if data.get("debt_wallet"):
+    extra_info += f"\n• Кошелек для возврата (USDT/TON): {data.get('debt_wallet')}"
+  if data.get("special_task"):
+    extra_info += f"\n• Задача (Особый заказ): {data.get('special_task')}"
+  price_val = f"{total_price} USDT" if total_price > 0 else "Расчет менеджера"
+  receipt_caption = f"🛒 Новый чек от @{user.username} (ID: <code>{user.id}</code>)\n• Услуга: {service_desc}\n• Сумма: {price_val}{extra_info}"
+
+  for staff_id in {uid for uid in (ADMIN_ID, MANAGER_ID) if uid is not None}:
     try:
-      extra_info = ""
-      if data.get("debt_info"):
-        extra_info += f"\n• Информация о долге: {data.get('debt_info')}"
-      if data.get("debt_wallet"):
-        extra_info += f"\n• Кошелек для возврата (USDT/TON): {data.get('debt_wallet')}"
-      if data.get("special_task"):
-        extra_info += f"\n• Задача (Особый заказ): {data.get('special_task')}"
-      price_val = f"{total_price} USDT" if total_price > 0 else "Расчет менеджера"
       await message.bot.send_photo(
-          chat_id=ADMIN_ID,
+          chat_id=staff_id,
           photo=message.photo[-1].file_id,
-          caption=f"🛒 Новый чек от @{user.username} (ID: <code>{user.id}</code>)\n• Услуга: {service_desc}\n• Сумма: {price_val}{extra_info}",
+          caption=receipt_caption,
           parse_mode="HTML"
       )
     except Exception:
