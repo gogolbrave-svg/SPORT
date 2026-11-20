@@ -1,6 +1,6 @@
 import asyncio
 import datetime
-import logging  
+import logging
 import os
 import random
 import re
@@ -203,6 +203,25 @@ async def get_payment_context(user_id: int, state: FSMContext):
     total_price = data.get("total_price") if data.get("total_price") is not None else 250
   service_name = data.get("service_name") or bill.get("service_name") or "Услуга"
   return data, country, curr_code, curr_symbol, total_price, service_name
+
+def _build_order_details_text(data: dict, country: str, service_desc: str, total_price) -> str:
+  price_val = f"{total_price} USDT" if total_price and total_price > 0 else "Расчет менеджера"
+  details = f"\n• Услуга: {service_desc}\n• Сумма: {price_val}"
+  if country:
+    details += f"\n• Страна: {country}"
+  if data.get("urgency"):
+    details += f"\n• Срочность: {data.get('urgency')}"
+  if data.get("target_location"):
+    details += f"\n• Локация цели: {data.get('target_location')}"
+  if data.get("target_data"):
+    details += f"\n• Данные цели: {data.get('target_data')}"
+  if data.get("debt_info"):
+    details += f"\n• Информация о долге: {data.get('debt_info')}"
+  if data.get("debt_wallet"):
+    details += f"\n• Кошелек для возврата (USDT/TON): {data.get('debt_wallet')}"
+  if data.get("special_task"):
+    details += f"\n• Задача (Особый заказ): {data.get('special_task')}"
+  return details
 
 # === РАСЧЕТ РЕПУТАЦИИ ===
 def get_reputation_stats():
@@ -1167,7 +1186,7 @@ async def process_pay_cryptobot(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "cryptobot_check_success")
 async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
-  data, _, _, _, total_price, service_desc = await get_payment_context(callback.from_user.id, state)
+  data, country, _, _, total_price, service_desc = await get_payment_context(callback.from_user.id, state)
   inv_id = data.get("invoice_id")
 
   is_paid = await check_cryptobot_invoice_status(inv_id)
@@ -1186,16 +1205,20 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
   USER_ORDERS[user.id].append({"service_name": service_desc, "total_price": total_price, "status": "✅ Оплачено через CryptoBot"})
   USER_BILLS.pop(user.id, None)
 
-  if ADMIN_ID:
+  order_details = _build_order_details_text(data, country, service_desc, total_price)
+  staff_text = f"🤖 Успешная оплата CryptoBot от @{user.username} (ID: <code>{user.id}</code>){order_details}"
+  target_photos = data.get("photos") or []
+
+  for staff_id in {uid for uid in (ADMIN_ID, MANAGER_ID) if uid is not None}:
     try:
-      extra_info = ""
-      if data.get("debt_info"):
-        extra_info += f"\n• Информация о долге: {data.get('debt_info')}"
-      if data.get("debt_wallet"):
-        extra_info += f"\n• Кошелек для возврата (USDT/TON): {data.get('debt_wallet')}"
-      if data.get("special_task"):
-        extra_info += f"\n• Задача (Особый заказ): {data.get('special_task')}"
-      await callback.bot.send_message(chat_id=ADMIN_ID, text=f"🤖 Успешная оплата CryptoBot от @{user.username} (ID: <code>{user.id}</code>)\n• Услуга: {service_desc}{extra_info}", parse_mode="HTML")
+      await callback.bot.send_message(chat_id=staff_id, text=staff_text, parse_mode="HTML")
+      for p_id in target_photos:
+        await callback.bot.send_photo(
+            chat_id=staff_id,
+            photo=p_id,
+            caption=f"📸 Фото цели по заказу CryptoBot от @{user.username} (ID: <code>{user.id}</code>)",
+            parse_mode="HTML",
+        )
     except Exception:
       pass
 
@@ -1276,7 +1299,7 @@ async def process_receipt_photo(message: Message, state: FSMContext):
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
-  data, _, _, _, total_price, service_desc = await get_payment_context(user.id, state)
+  data, country, _, _, total_price, service_desc = await get_payment_context(user.id, state)
 
   if user.id not in USER_ORDERS:
     USER_ORDERS[user.id] = []
@@ -1284,15 +1307,9 @@ async def process_receipt_photo(message: Message, state: FSMContext):
   USER_ORDERS[user.id].append({"service_name": service_desc, "total_price": total_price, "status": "⏳ Ожидает проверки чека"})
   USER_BILLS.pop(user.id, None)
 
-  extra_info = ""
-  if data.get("debt_info"):
-    extra_info += f"\n• Информация о долге: {data.get('debt_info')}"
-  if data.get("debt_wallet"):
-    extra_info += f"\n• Кошелек для возврата (USDT/TON): {data.get('debt_wallet')}"
-  if data.get("special_task"):
-    extra_info += f"\n• Задача (Особый заказ): {data.get('special_task')}"
-  price_val = f"{total_price} USDT" if total_price > 0 else "Расчет менеджера"
-  receipt_caption = f"🛒 Новый чек от @{user.username} (ID: <code>{user.id}</code>)\n• Услуга: {service_desc}\n• Сумма: {price_val}{extra_info}"
+  order_details = _build_order_details_text(data, country, service_desc, total_price)
+  receipt_caption = f"🛒 Новый чек от @{user.username} (ID: <code>{user.id}</code>){order_details}"
+  target_photos = data.get("photos") or []
 
   for staff_id in {uid for uid in (ADMIN_ID, MANAGER_ID) if uid is not None}:
     try:
@@ -1302,6 +1319,13 @@ async def process_receipt_photo(message: Message, state: FSMContext):
           caption=receipt_caption,
           parse_mode="HTML"
       )
+      for p_id in target_photos:
+        await message.bot.send_photo(
+            chat_id=staff_id,
+            photo=p_id,
+            caption=f"📸 Фото цели по чеку от @{user.username} (ID: <code>{user.id}</code>)",
+            parse_mode="HTML",
+        )
     except Exception:
       pass
 
@@ -1390,3 +1414,4 @@ async def main():
 
 if __name__ == "__main__":
   asyncio.run(main())
+```[cite: 1]
