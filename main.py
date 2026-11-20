@@ -1022,8 +1022,8 @@ async def finish_photos(callback: CallbackQuery, state: FSMContext):
   await state.set_state(OrderForm.urgency)
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="⚡ За 2-3 часа (+30$)", callback_data="urg_fast_30", style="primary")],
-          [InlineKeyboardButton(text="🕐 Завтра (+10$)", callback_data="urg_tomorrow_10", style="danger")],
+          [InlineKeyboardButton(text="⚡ За 2-3 часа (+50$)", callback_data="urg_fast_50", style="primary")],
+          [InlineKeyboardButton(text="🕐 Завтра (+20$)", callback_data="urg_tomorrow_20", style="danger")],
           [InlineKeyboardButton(text="📅 Стандартно (2-5 дней)", callback_data="urg_standard_0", style="primary")],
           [InlineKeyboardButton(text="⬅️ Назад", callback_data="start_order", style="danger")],
       ]
