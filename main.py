@@ -18,11 +18,13 @@ from aiogram.types import (
     InputMediaPhoto,
 )
 from aiohttp import ClientSession, web
+import asyncpg
 from dotenv import load_dotenv
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not BOT_TOKEN:
   raise ValueError("❌ BOT_TOKEN не найден!")
@@ -55,7 +57,7 @@ class SupportForm(StatesGroup):
   photo = State()
 
 
-# Базы данных в памяти
+# Базы данных в памяти (синхронизируются с PostgreSQL при наличии DATABASE_URL)
 USER_ORDERS = {}
 USER_LAST_COUNTRY = {}
 USER_BILLS = {}
@@ -67,7 +69,268 @@ CRYPTO_DETAILS = {}
 BANNED_USERS = set()
 BANNER_CACHE = {}  # Кэш file_id баннеров для мгновенной загрузки
 
+DB_POOL = None
+DB_WRITE_QUEUE = None
+
 router = Router()
+
+
+# === POSTGRESQL СЛОЙ ===
+async def init_db():
+  global DB_POOL, DB_WRITE_QUEUE
+  if not DATABASE_URL:
+    logger.warning(
+        "⚠️ DATABASE_URL не задан — бот работает только в оперативной памяти."
+    )
+    return
+
+  dsn = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+  DB_POOL = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
+
+  async with DB_POOL.acquire() as conn:
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS card_details (
+            id SERIAL PRIMARY KEY,
+            details TEXT NOT NULL,
+            bank TEXT NOT NULL,
+            country TEXT NOT NULL,
+            frozen_until TIMESTAMP NULL
+        );
+        CREATE TABLE IF NOT EXISTS crypto_details (
+            network_key TEXT PRIMARY KEY,
+            address TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id BIGINT PRIMARY KEY
+        );
+        CREATE TABLE IF NOT EXISTS known_users (
+            user_id BIGINT PRIMARY KEY,
+            last_seen TIMESTAMP NULL
+        );
+        CREATE TABLE IF NOT EXISTS user_last_country (
+            user_id BIGINT PRIMARY KEY,
+            country TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS user_orders (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            service_name TEXT NOT NULL,
+            total_price INTEGER NOT NULL,
+            status TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS user_bills (
+            user_id BIGINT PRIMARY KEY,
+            service_name TEXT NOT NULL,
+            total_price INTEGER NOT NULL,
+            country TEXT NOT NULL,
+            curr_code TEXT NOT NULL,
+            curr_symbol TEXT NOT NULL,
+            bill_msg_id BIGINT NULL
+        );
+    """)
+
+    # Загрузка реквизитов карт
+    CARD_DETAILS.clear()
+    for row in await conn.fetch(
+        "SELECT details, bank, country, frozen_until FROM card_details ORDER BY"
+        " id ASC"
+    ):
+      CARD_DETAILS.append({
+          "details": row["details"],
+          "bank": row["bank"],
+          "country": row["country"],
+          "frozen_until": row["frozen_until"],
+      })
+
+    # Загрузка криптореквизитов
+    CRYPTO_DETAILS.clear()
+    for row in await conn.fetch(
+        "SELECT network_key, address FROM crypto_details"
+    ):
+      CRYPTO_DETAILS[row["network_key"]] = row["address"]
+
+    # Загрузка банов
+    BANNED_USERS.clear()
+    for row in await conn.fetch("SELECT user_id FROM banned_users"):
+      BANNED_USERS.add(int(row["user_id"]))
+
+    # Загрузка известных пользователей
+    KNOWN_USERS.clear()
+    for row in await conn.fetch("SELECT user_id, last_seen FROM known_users"):
+      KNOWN_USERS[int(row["user_id"])] = row["last_seen"]
+
+    # Загрузка последней страны пользователя
+    USER_LAST_COUNTRY.clear()
+    for row in await conn.fetch("SELECT user_id, country FROM user_last_country"):
+      USER_LAST_COUNTRY[int(row["user_id"])] = row["country"]
+
+    # Загрузка заказов
+    USER_ORDERS.clear()
+    for row in await conn.fetch(
+        "SELECT user_id, service_name, total_price, status FROM user_orders"
+        " ORDER BY id ASC"
+    ):
+      uid = int(row["user_id"])
+      USER_ORDERS.setdefault(uid, []).append({
+          "service_name": row["service_name"],
+          "total_price": row["total_price"],
+          "status": row["status"],
+      })
+
+    # Загрузка счетов
+    USER_BILLS.clear()
+    for row in await conn.fetch("""
+        SELECT user_id, service_name, total_price, country, curr_code, curr_symbol, bill_msg_id
+        FROM user_bills
+    """):
+      uid = int(row["user_id"])
+      USER_BILLS[uid] = {
+          "service_name": row["service_name"],
+          "total_price": row["total_price"],
+          "country": row["country"],
+          "curr_code": row["curr_code"],
+          "curr_symbol": row["curr_symbol"],
+          "bill_msg_id": row["bill_msg_id"],
+      }
+
+  DB_WRITE_QUEUE = asyncio.Queue()
+  asyncio.create_task(db_writer_worker())
+  logger.info("✅ PostgreSQL подключен и синхронизирован.")
+
+
+async def _exec_db_action(action: tuple):
+  if not DB_POOL:
+    return
+  kind = action[0]
+  try:
+    async with DB_POOL.acquire() as conn:
+      if kind == "ban_add":
+        _, user_id = action
+        await conn.execute(
+            "INSERT INTO banned_users (user_id) VALUES ($1) ON CONFLICT"
+            " DO NOTHING",
+            user_id,
+        )
+      elif kind == "card_add":
+        _, details, bank, country = action
+        await conn.execute(
+            "INSERT INTO card_details (details, bank, country, frozen_until)"
+            " VALUES ($1, $2, $3, NULL)",
+            details,
+            bank,
+            country,
+        )
+      elif kind == "card_delete":
+        _, details, bank, country = action
+        await conn.execute(
+            "DELETE FROM card_details WHERE details = $1 AND bank = $2 AND"
+            " LOWER(country) = LOWER($3)",
+            details,
+            bank,
+            country,
+        )
+      elif kind == "card_freeze":
+        _, details, bank, country, frozen_until = action
+        await conn.execute(
+            "UPDATE card_details SET frozen_until = $4 WHERE details = $1 AND"
+            " bank = $2 AND LOWER(country) = LOWER($3)",
+            details,
+            bank,
+            country,
+            frozen_until,
+        )
+      elif kind == "crypto_set":
+        _, net_key, address = action
+        await conn.execute(
+            """
+            INSERT INTO crypto_details (network_key, address) VALUES ($1, $2)
+            ON CONFLICT (network_key) DO UPDATE SET address = EXCLUDED.address
+            """,
+            net_key,
+            address,
+        )
+      elif kind == "crypto_delete":
+        _, net_key = action
+        await conn.execute(
+            "DELETE FROM crypto_details WHERE network_key = $1", net_key
+        )
+      elif kind == "known_user":
+        _, user_id, last_seen = action
+        await conn.execute(
+            """
+            INSERT INTO known_users (user_id, last_seen) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET last_seen = EXCLUDED.last_seen
+            """,
+            user_id,
+            last_seen,
+        )
+      elif kind == "last_country":
+        _, user_id, country = action
+        await conn.execute(
+            """
+            INSERT INTO user_last_country (user_id, country) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET country = EXCLUDED.country
+            """,
+            user_id,
+            country,
+        )
+      elif kind == "order_add":
+        _, user_id, service_name, total_price, status = action
+        await conn.execute(
+            "INSERT INTO user_orders (user_id, service_name, total_price,"
+            " status) VALUES ($1, $2, $3, $4)",
+            user_id,
+            service_name,
+            int(total_price or 0),
+            status,
+        )
+      elif kind == "bill_set":
+        _, user_id, bill_data = action
+        await conn.execute(
+            """
+            INSERT INTO user_bills (user_id, service_name, total_price, country, curr_code, curr_symbol, bill_msg_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (user_id) DO UPDATE SET
+                service_name = EXCLUDED.service_name,
+                total_price = EXCLUDED.total_price,
+                country = EXCLUDED.country,
+                curr_code = EXCLUDED.curr_code,
+                curr_symbol = EXCLUDED.curr_symbol,
+                bill_msg_id = EXCLUDED.bill_msg_id
+            """,
+            user_id,
+            bill_data.get("service_name", "Услуга"),
+            int(bill_data.get("total_price", 0) or 0),
+            bill_data.get("country", "Россия"),
+            bill_data.get("curr_code", "RUB"),
+            bill_data.get("curr_symbol", "₽"),
+            bill_data.get("bill_msg_id"),
+        )
+      elif kind == "bill_delete":
+        _, user_id = action
+        await conn.execute(
+            "DELETE FROM user_bills WHERE user_id = $1", user_id
+        )
+  except Exception as e:
+    logger.error(f"Ошибка записи в PostgreSQL ({kind}): {e}")
+
+
+async def db_writer_worker():
+  while True:
+    action = await DB_WRITE_QUEUE.get()
+    try:
+      await _exec_db_action(action)
+    finally:
+      DB_WRITE_QUEUE.task_done()
+
+
+def queue_db(action: tuple):
+  if not DATABASE_URL:
+    return
+  if DB_WRITE_QUEUE is not None:
+    DB_WRITE_QUEUE.put_nowait(action)
+  else:
+    asyncio.create_task(_exec_db_action(action))
 
 
 # === MIDDLEWARE ДЛЯ ПРОВЕРКИ БАНА ===
@@ -122,7 +385,9 @@ CRYPTO_NETWORKS = {
 
 
 def normalize_crypto_key(raw_network: str):
-  cleaned = " ".join(raw_network.lower().replace("(", " ").replace(")", " ").split())
+  cleaned = " ".join(
+      raw_network.lower().replace("(", " ").replace(")", " ").split()
+  )
   for net_key, info in CRYPTO_NETWORKS.items():
     if cleaned == net_key or cleaned in info["keys"]:
       return net_key
@@ -139,6 +404,13 @@ def get_next_card(country: str):
         continue
       elif card["frozen_until"] and card["frozen_until"] <= now:
         card["frozen_until"] = None
+        queue_db((
+            "card_freeze",
+            card["details"],
+            card["bank"],
+            card["country"],
+            None,
+        ))
       active.append(card)
 
   if not active:
@@ -187,7 +459,7 @@ def build_payment_keyboard(country: str) -> InlineKeyboardMarkup:
       "Узбекистан": "💳 Оплата картой",
       "Молдова": "💳 Оплата картой",
   }
-  card_btn_text = card_btn_text_map.get(country, "💳 Оплатить картой")
+  card_btn_text = card_btn_text_map.get(country, "💳 Оплата картой")
   return InlineKeyboardMarkup(
       inline_keyboard=[
           [
@@ -526,7 +798,9 @@ async def show_main_menu(event: Message | CallbackQuery, state: FSMContext):
   await state.clear()
   user_id = event.from_user.id
   if user_id not in KNOWN_USERS:
-    KNOWN_USERS[user_id] = datetime.datetime.now()
+    now_dt = datetime.datetime.now()
+    KNOWN_USERS[user_id] = now_dt
+    queue_db(("known_user", user_id, now_dt))
 
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -579,6 +853,7 @@ async def cmd_ban_user(message: Message):
   if target.isdigit():
     user_id = int(target)
     BANNED_USERS.add(user_id)
+    queue_db(("ban_add", user_id))
     await message.reply(
         f"✅ Пользователь с ID <code>{user_id}</code> заблокирован.",
         parse_mode="HTML",
@@ -681,6 +956,13 @@ async def cmd_bill_user(message: Message, state: FSMContext):
         "total_price": amount_val,
         "status": "🧾 Выставлен счет",
     })
+    queue_db((
+        "order_add",
+        target_user_id,
+        service_name,
+        amount_val,
+        "🧾 Выставлен счет",
+    ))
 
   try:
     banner_name = "payment.jpg"
@@ -711,6 +993,7 @@ async def cmd_bill_user(message: Message, state: FSMContext):
           parse_mode="HTML",
       )
     USER_BILLS[target_user_id]["bill_msg_id"] = sent_bill.message_id
+    queue_db(("bill_set", target_user_id, dict(USER_BILLS[target_user_id])))
     if message.from_user.id == target_user_id:
       await state.update_data(bot_msg_id=sent_bill.message_id)
     await message.reply(
@@ -831,6 +1114,7 @@ async def cmd_add_card(message: Message):
     net_key = normalize_crypto_key(net_part)
     if net_key:
       CRYPTO_DETAILS[net_key] = address
+      queue_db(("crypto_set", net_key, address))
       net_name = CRYPTO_NETWORKS[net_key]["name"]
       await message.reply(
           f"✅ Криптореквизиты добавлены!\n🪙 <b>{net_name}</b>\n<code>{address}</code>",
@@ -850,6 +1134,7 @@ async def cmd_add_card(message: Message):
       "country": country,
       "frozen_until": None,
   })
+  queue_db(("card_add", details, bank, country))
   await message.reply(
       f"✅ Реквизиты добавлены!\n🌍 {country} | 🏦 {bank}\n<code>{details}</code>",
       parse_mode="HTML",
@@ -876,6 +1161,7 @@ async def cmd_delete_card(message: Message):
   if net_key:
     if net_key in CRYPTO_DETAILS:
       CRYPTO_DETAILS.pop(net_key, None)
+      queue_db(("crypto_delete", net_key))
       await message.reply(
           f"✅ Криптореквизиты для <b>{CRYPTO_NETWORKS[net_key]['name']}</b> удалены.",
           parse_mode="HTML",
@@ -902,6 +1188,7 @@ async def cmd_delete_card(message: Message):
       )
   ]
   if len(CARD_DETAILS) < initial_len:
+    queue_db(("card_delete", details, bank, country))
     await message.reply("✅ Удалено.")
   else:
     await message.reply("❌ Не найдено.")
@@ -933,7 +1220,9 @@ async def cmd_freeze_card(message: Message):
         and card["bank"] == bank
         and card["country"].lower() == country.lower()
     ):
-      card["frozen_until"] = now + datetime.timedelta(hours=24)
+      frozen_until = now + datetime.timedelta(hours=24)
+      card["frozen_until"] = frozen_until
+      queue_db(("card_freeze", details, bank, country, frozen_until))
       found = True
       break
   if found:
@@ -1071,6 +1360,7 @@ async def scheduled_broadcast(bot: Bot):
             )
 
           KNOWN_USERS[user_id] = now
+          queue_db(("known_user", user_id, now))
         except Exception as e:
           logger.error(f"Ошибка рассылки: {e}")
 
@@ -1152,7 +1442,9 @@ async def cmd_restart(message: Message, state: FSMContext):
 async def cmd_order(message: Message, state: FSMContext):
   user_id = message.from_user.id
   if user_id not in KNOWN_USERS:
-    KNOWN_USERS[user_id] = datetime.datetime.now()
+    now_dt = datetime.datetime.now()
+    KNOWN_USERS[user_id] = now_dt
+    queue_db(("known_user", user_id, now_dt))
   await state.set_state(OrderForm.service)
   text = (
       "🛒 <b>Каталог услуг</b>\n\nВыберите подходящий вариант из списка ниже:"
@@ -1533,6 +1825,7 @@ async def process_country(callback: CallbackQuery, state: FSMContext):
   }
   selected = names.get(c_code, c_code)
   USER_LAST_COUNTRY[callback.from_user.id] = selected
+  queue_db(("last_country", callback.from_user.id, selected))
   curr_info = COUNTRY_CURRENCIES.get(
       selected, {"code": "USD", "symbol": "USD"}
   )
@@ -2041,7 +2334,15 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
       "total_price": total_price,
       "status": "✅ Оплачено через CryptoBot",
   })
+  queue_db((
+      "order_add",
+      user.id,
+      service_desc,
+      total_price,
+      "✅ Оплачено через CryptoBot",
+  ))
   USER_BILLS.pop(user.id, None)
+  queue_db(("bill_delete", user.id))
 
   order_details = _build_order_details_text(
       data, country, service_desc, total_price
@@ -2237,7 +2538,15 @@ async def process_receipt_photo(message: Message, state: FSMContext):
       "total_price": total_price,
       "status": "⏳ Ожидает проверки чека",
   })
+  queue_db((
+      "order_add",
+      user.id,
+      service_desc,
+      total_price,
+      "⏳ Ожидает проверки чека",
+  ))
   USER_BILLS.pop(user.id, None)
+  queue_db(("bill_delete", user.id))
 
   order_details = _build_order_details_text(
       data, country, service_desc, total_price
@@ -2368,6 +2677,7 @@ async def start_web_server():
 
 
 async def main():
+  await init_db()
   bot = Bot(token=BOT_TOKEN)
   dp = Dispatcher()
   dp.include_router(router)
