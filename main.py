@@ -63,6 +63,7 @@ KNOWN_USERS = {}
 ABANDONED_CHECKOUTS = {}
 CARD_DETAILS = []
 CARD_POINTERS = {}
+CRYPTO_DETAILS = {}
 BANNED_USERS = set()
 BANNER_CACHE = {}  # Кэш file_id баннеров для мгновенной загрузки
 
@@ -95,29 +96,37 @@ COUNTRY_CURRENCIES = {
     "Молдова": {"code": "MDL", "symbol": "лей"},
 }
 
-# === КРИПТОСЕТИ И РЕКВИЗИТЫ (КАК ВО 2-М БОТЕ) ===
+# === КРИПТОСЕТИ ===
 CRYPTO_NETWORKS = {
     "trc20": {
         "name": "USDT (TRC-20)",
-        "address": "TYd1ekJgTHnFfgAVYXsi7689GaG5oZN3Xe",
         "network": "TRC-20",
+        "keys": ["usdt trc-20", "usdt trc20", "trc-20", "trc20"],
     },
     "bep20": {
         "name": "USDT (BEP-20)",
-        "address": "0x0A6C6634f8FD920a5E9E0d241CD46d6C15377f39",
         "network": "BEP-20",
+        "keys": ["usdt bep-20", "usdt bep20", "bep-20", "bep20"],
     },
     "ton": {
         "name": "TON",
-        "address": "UQDwk7PZoWr0zHv-BItBEGxnq4uyj81z6BlIw74heDgF-Shd",
         "network": "TON",
+        "keys": ["ton"],
     },
     "btc": {
         "name": "Bitcoin (BTC)",
-        "address": "bc1qj7xy0645vcza7l3et5s8nuahllua9a439c0795",
         "network": "Bitcoin",
+        "keys": ["bitcoin (btc)", "bitcoin", "btc"],
     },
 }
+
+
+def normalize_crypto_key(raw_network: str):
+  cleaned = " ".join(raw_network.lower().replace("(", " ").replace(")", " ").split())
+  for net_key, info in CRYPTO_NETWORKS.items():
+    if cleaned == net_key or cleaned in info["keys"]:
+      return net_key
+  return None
 
 
 # === ФУНКЦИЯ ЧЕРЕДОВАНИЯ РЕКВИЗИТОВ ===
@@ -173,10 +182,10 @@ def build_payment_keyboard(country: str) -> InlineKeyboardMarkup:
   card_btn_text_map = {
       "Россия": "💳 Оплатить на СБП",
       "Казахстан": "💳 Оплатить на Kaspi",
-      "Украина": "💳 Оплатить картой",
-      "Беларусь": "💳 Оплатить картой",
-      "Узбекистан": "💳 Оплатить картой",
-      "Молдова": "💳 Оплатить картой",
+      "Украина": "💳 Оплата картой",
+      "Беларусь": "💳 Оплата картой",
+      "Узбекистан": "💳 Оплата картой",
+      "Молдова": "💳 Оплата картой",
   }
   card_btn_text = card_btn_text_map.get(country, "💳 Оплатить картой")
   return InlineKeyboardMarkup(
@@ -805,10 +814,30 @@ async def cmd_add_card(message: Message):
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
     await message.reply(
-        "❌ Использование: `/add +783839293 ОзонБанк Россия`", parse_mode="Markdown"
+        "❌ Использование:\n"
+        "• Карта: `/add +783839293 ОзонБанк Россия`\n"
+        "• Крипта: `/add TYd1ekJgTHnFfgAVYXsi7689GaG5oZN3Xe USDT TRC-20`",
+        parse_mode="Markdown",
     )
     return
-  parts = args[1].split()
+
+  raw_arg = args[1].strip()
+  parts = raw_arg.split()
+
+  # Проверяем формат добавления крипты: /add <адрес> <USDT TRC-20 / USDT BEP-20 / TON / BTC>
+  if len(parts) >= 2:
+    address = parts[0]
+    net_part = " ".join(parts[1:])
+    net_key = normalize_crypto_key(net_part)
+    if net_key:
+      CRYPTO_DETAILS[net_key] = address
+      net_name = CRYPTO_NETWORKS[net_key]["name"]
+      await message.reply(
+          f"✅ Криптореквизиты добавлены!\n🪙 <b>{net_name}</b>\n<code>{address}</code>",
+          parse_mode="HTML",
+      )
+      return
+
   if len(parts) < 3:
     await message.reply("❌ Неверный формат.")
     return
@@ -835,11 +864,27 @@ async def cmd_delete_card(message: Message):
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
     await message.reply(
-        "❌ Использование: `/delete <реквизиты> <Банк> <Страна>`",
+        "❌ Использование:\n"
+        "• Карта: `/delete <реквизиты> <Банк> <Страна>`\n"
+        "• Крипта: `/delete <USDT TRC-20 / TON / BEP-20 / BTC>`",
         parse_mode="Markdown",
     )
     return
-  parts = args[1].split()
+
+  raw_arg = args[1].strip()
+  net_key = normalize_crypto_key(raw_arg)
+  if net_key:
+    if net_key in CRYPTO_DETAILS:
+      CRYPTO_DETAILS.pop(net_key, None)
+      await message.reply(
+          f"✅ Криптореквизиты для <b>{CRYPTO_NETWORKS[net_key]['name']}</b> удалены.",
+          parse_mode="HTML",
+      )
+    else:
+      await message.reply("❌ Криптореквизиты для этой сети не найдены.")
+    return
+
+  parts = raw_arg.split()
   if len(parts) < 3:
     await message.reply("❌ Неверный формат.")
     return
@@ -2086,6 +2131,40 @@ async def process_pay_crypto(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Сеть не найдена", show_alert=True)
     return
 
+  address = CRYPTO_DETAILS.get(net_key)
+  if not address:
+    text = (
+        "❌ <b>Реквизиты временно недоступны</b>\n\n"
+        f"В данный момент реквизиты для сети <b>{net_info['name']}</b>"
+        " недоступны, мы уже решаем эту проблему. Оплатите другим способом"
+        " (например, через CryptoBot или карту) 👇"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🤖 CryptoBot",
+                    callback_data="pay_cryptobot",
+                    style="danger",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💳 Карта / СБП",
+                    callback_data="pay_card_option",
+                    style="primary",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад", callback_data="crypto_expert", style="primary"
+                )
+            ],
+        ]
+    )
+    await render_step(callback, state, "payment.jpg", text, keyboard)
+    return
+
   _, _, curr_code, curr_symbol, total_price, _ = await get_payment_context(
       callback.from_user.id, state
   )
@@ -2102,7 +2181,7 @@ async def process_pay_crypto(callback: CallbackQuery, state: FSMContext):
       f"💳 <b>Оплата {net_info['name']}</b>\n\n"
       f"• Сумма: {price_str}\n"
       f"• Сеть: <b>{net_info['network']}</b>\n"
-      f"• Реквизиты:\n<code>{net_info['address']}</code>\n\n"
+      f"• Реквизиты:\n<code>{address}</code>\n\n"
       "💡 <i>После перевода прикрепите чек.</i>"
   )
   keyboard = InlineKeyboardMarkup(
